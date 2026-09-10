@@ -21,16 +21,23 @@ const MAX_FAILED_ATTEMPTS: u32 = 3;
 const LOCKOUT_DURATION: Duration = Duration::from_secs(15 * 60); // 15 minutes
 /// How often the background task sweeps the lockout table for expired entries.
 const LOCKOUT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 minutes
-/// Session tokens expire after this duration. Stolen tokens have limited utility.
-const TOKEN_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+/// Session cookie lifetime. Browsers cap cookie lifetimes at ~400 days, so a
+/// 1-year value effectively means "until the password changes". The cookie is
+/// rewritten on every successful login, keeping it fresh.
+const AUTH_COOKIE_MAX_AGE: Duration = Duration::from_secs(365 * 24 * 60 * 60); // 1 year
 const AUTH_COOKIE_NAME: &str = "oly_auth_token";
+/// Domain-separation label for the deterministic session-token derivation.
+/// Bumping the version suffix invalidates all previously issued tokens.
+const TOKEN_DERIVATION_LABEL: &[u8] = b"oly-auth-session-token-v1";
 
 // ── AuthState ────────────────────────────────────────────────────────────────
 
 pub struct AuthState {
     password_hash: String,
-    /// Maps token → creation time so expired tokens can be evicted.
-    tokens: Mutex<HashMap<String, Instant>>,
+    /// The single deterministic session token (see `derive_session_token`).
+    /// It is valid for as long as the password hash is unchanged — no expiry,
+    /// no in-memory registry, and it survives daemon restarts.
+    expected_token: String,
     /// Per-IP lockout table. Each client is tracked independently so that a
     /// brute-force attempt from one IP cannot lock out legitimate users.
     lockout: Mutex<HashMap<IpAddr, LockoutRecord>>,
@@ -49,9 +56,10 @@ pub(crate) enum FailureOutcome {
 
 impl AuthState {
     pub fn new(password_hash: String) -> Arc<Self> {
+        let expected_token = derive_session_token(&password_hash);
         let state = Arc::new(Self {
             password_hash,
-            tokens: Mutex::new(HashMap::new()),
+            expected_token,
             lockout: Mutex::new(HashMap::new()),
         });
         state.spawn_cleanup_task();
@@ -82,31 +90,15 @@ impl AuthState {
                         "auth: background cleanup evicted expired lockout records"
                     );
                 }
-                // Also evict expired session tokens.
-                let mut tokens = state.tokens.lock().await;
-                let token_before = tokens.len();
-                tokens.retain(|_, created| created.elapsed() < TOKEN_MAX_AGE);
-                let token_removed = token_before - tokens.len();
-                if token_removed > 0 {
-                    debug!(
-                        removed = token_removed,
-                        "auth: background cleanup evicted expired session tokens"
-                    );
-                }
             }
         });
     }
 
-    pub async fn is_valid_token(&self, token: &str) -> bool {
-        let mut tokens = self.tokens.lock().await;
-        if let Some(&created) = tokens.get(token) {
-            if created.elapsed() < TOKEN_MAX_AGE {
-                return true;
-            }
-            // Token expired — evict it.
-            tokens.remove(token);
-        }
-        false
+    /// Validate a session token against the deterministic expected token.
+    /// No lock and no expiry: the token stays valid until the password hash
+    /// changes (daemon restart with a new password) or auth is disabled.
+    pub fn is_valid_token(&self, token: &str) -> bool {
+        constant_time_eq(token.as_bytes(), self.expected_token.as_bytes())
     }
 
     /// Returns `Some(locked_until)` if the IP is currently locked out.
@@ -149,6 +141,42 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
     Ok(argon2
         .hash_password(password.as_bytes(), &salt)?
         .to_string())
+}
+
+/// Derive the deterministic session token for a password hash.
+///
+/// The token is `hex(HMAC-SHA256(key = password hash, msg = label))`:
+/// - Knowing the token does not reveal the password hash (HMAC is one-way).
+/// - Changing the password changes the hash, invalidating every previously
+///   issued token/cookie — that is the only revocation mechanism needed.
+/// - The token is stable across daemon restarts, so browsers stay logged in.
+/// - Every oly instance configured with the same password derives the same
+///   token, so cookies forwarded through the reverse proxy are accepted by
+///   upstream instances: proxy and normal access share one login.
+fn derive_session_token(password_hash: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(password_hash.as_bytes())
+        .expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(TOKEN_DERIVATION_LABEL);
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Constant-time byte comparison so token checks do not leak how many leading
+/// characters of the expected token an attacker guessed correctly.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |diff, (l, r)| diff | (l ^ r))
+        == 0
 }
 
 // ── Request / Response DTOs ──────────────────────────────────────────────────
@@ -261,12 +289,8 @@ pub async fn login(
 
     if verified.is_some() {
         auth.lockout.lock().await.remove(&client_ip);
-        let token = uuid::Uuid::new_v4().to_string();
-        auth.tokens
-            .lock()
-            .await
-            .insert(token.clone(), Instant::now());
-        info!(ip = %client_ip, "auth: login success — token issued");
+        let token = auth.expected_token.clone();
+        info!(ip = %client_ip, "auth: login success — session token issued");
         let secure = request_is_tls(&headers);
         return (
             StatusCode::OK,
@@ -312,7 +336,11 @@ pub async fn login(
     }
 }
 
-/// POST /api/auth/logout — revoke the caller's token.
+/// POST /api/auth/logout — clear the caller's auth cookie.
+///
+/// Session tokens are deterministic (derived from the password hash), so they
+/// cannot be revoked server-side; logout clears the cookie client-side. A new
+/// password is the only way to invalidate a leaked token.
 pub async fn logout(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -320,22 +348,15 @@ pub async fn logout(
 ) -> impl IntoResponse {
     let client_ip = effective_ip(&headers, peer.ip());
 
-    let Some(auth) = &state.auth else {
+    if state.auth.is_none() {
         return (
             StatusCode::OK,
             [(axum::http::header::SET_COOKIE, clear_auth_cookie())],
         )
             .into_response();
-    };
-
-    if let Some(token) = extract_request_token_parts(&headers, None) {
-        let removed = auth.tokens.lock().await.remove(&token);
-        if removed.is_some() {
-            info!(ip = %client_ip, "auth: logout — token revoked");
-        } else {
-            debug!(ip = %client_ip, "auth: logout — token not found (already expired?)");
-        }
     }
+
+    debug!(ip = %client_ip, "auth: logout — auth cookie cleared");
 
     (
         StatusCode::OK,
@@ -387,7 +408,7 @@ pub(super) async fn authorize_request(
     };
 
     if let Some(token) = token {
-        if auth.is_valid_token(&token).await {
+        if auth.is_valid_token(&token) {
             debug!(path = %path, "auth: authorized request");
             return None;
         }
@@ -451,7 +472,8 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
 
 fn build_auth_cookie(token: &str, secure: bool) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
-    format!("{AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax{secure_flag}")
+    let max_age = AUTH_COOKIE_MAX_AGE.as_secs();
+    format!("{AUTH_COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure_flag}")
 }
 
 fn clear_auth_cookie() -> String {
@@ -470,9 +492,54 @@ fn request_is_tls(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COOKIE_NAME, build_auth_cookie, clear_auth_cookie, extract_request_token_parts,
+        AUTH_COOKIE_NAME, AuthState, build_auth_cookie, clear_auth_cookie, constant_time_eq,
+        derive_session_token, extract_request_token_parts, hash_password,
     };
     use axum::http::{HeaderMap, header};
+
+    #[test]
+    fn derived_token_is_stable_and_password_sensitive() {
+        let hash_a = hash_password("hunter2").expect("password should hash");
+        let hash_b = hash_password("hunter2").expect("password should hash");
+        let hash_c = hash_password("different").expect("password should hash");
+
+        let token_a1 = derive_session_token(&hash_a);
+        let token_a2 = derive_session_token(&hash_a);
+        let token_b = derive_session_token(&hash_b);
+        let token_c = derive_session_token(&hash_c);
+
+        // Same hash → same token (deterministic, survives restarts).
+        assert_eq!(token_a1, token_a2);
+        // Same password, different salt → different token. This is expected:
+        // the daemon re-derives its own token at startup, and password changes
+        // always come with a new hash.
+        assert_ne!(token_a1, token_b);
+        // Different password → different token.
+        assert_ne!(token_a1, token_c);
+        // Token format: 32-byte HMAC output, hex-encoded.
+        assert_eq!(token_a1.len(), 64);
+        assert!(token_a1.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn auth_state_validates_derived_token_without_expiry() {
+        let state = AuthState::new(hash_password("hunter2").expect("password should hash"));
+
+        assert!(state.is_valid_token(&state.expected_token));
+        assert!(!state.is_valid_token("not-the-token"));
+        // Prefix of the real token must be rejected (constant-time eq checks
+        // full length).
+        let truncated = &state.expected_token[..state.expected_token.len() - 1];
+        assert!(!state.is_valid_token(truncated));
+    }
+
+    #[test]
+    fn constant_time_comparison_behaves() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+    }
 
     #[test]
     fn extract_request_token_prefers_authorization_header() {
@@ -516,6 +583,7 @@ mod tests {
 
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"));
+        assert!(set_cookie.contains("Max-Age=31536000"));
         assert!(!set_cookie.contains("Secure"));
         assert!(secure_cookie.contains("; Secure"));
         assert!(clear_cookie.contains("Max-Age=0"));
