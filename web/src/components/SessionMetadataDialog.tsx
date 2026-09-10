@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { FormActions, FormError, FormField } from '@/components/ui/form-field'
+import NotificationToggle from '@/components/NotificationToggle'
 
 type SessionMetadataDialogProps = {
   open: boolean
@@ -62,13 +63,18 @@ function SessionMetadataDialogForm({
 }: SessionMetadataDialogFormProps) {
   const [title, setTitle] = useState(() => session?.title ?? '')
   const [tags, setTags] = useState(() => formatSessionTagInput(session?.tags ?? []))
+  const [notificationsEnabled, setNotificationsEnabled] = useState(
+    () => session?.notifications_enabled ?? false
+  )
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const isRunning =
+    session.status === 'created' || session.status === 'running' || session.status === 'stopping'
 
   async function handleSubmit() {
     const spec = buildSessionMetadataUpdateSpec(
-      { title: session.title, tags: session.tags },
-      { title, tags }
+      { title: session.title, tags: session.tags, notificationsEnabled: session.notifications_enabled },
+      { title, tags, notificationsEnabled }
     )
     if (Object.keys(spec).length === 0) {
       onClose()
@@ -125,6 +131,16 @@ function SessionMetadataDialogForm({
               placeholder="prod, release"
             />
           </FormField>
+          <NotificationToggle
+            checked={notificationsEnabled}
+            disabled={!isRunning}
+            description={
+              isRunning
+                ? 'Get a push notification when the session needs attention or exits.'
+                : 'Notifications are unavailable after the session exits.'
+            }
+            onCheckedChange={setNotificationsEnabled}
+          />
           {error ? <FormError>{error}</FormError> : null}
           <FormActions>
             <Button type="button" variant="ghost" size="sm" onClick={onClose}>

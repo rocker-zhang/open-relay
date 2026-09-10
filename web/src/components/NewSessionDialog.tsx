@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { FormActions, FormError, FormField } from '@/components/ui/form-field'
+import NotificationToggle from '@/components/NotificationToggle'
 import type { NewSessionInitialValues } from './new-session-dialog-values'
 
 export default function NewSessionDialog({
@@ -25,6 +26,7 @@ export default function NewSessionDialog({
   const [title, setTitle] = useState('')
   const [tags, setTags] = useState('')
   const [cwd, setCwd] = useState('')
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const wasOpenRef = useRef(false)
@@ -38,6 +40,7 @@ export default function NewSessionDialog({
     setTitle(initialValues?.title ?? '')
     setTags(initialValues?.tags ?? '')
     setCwd(initialValues?.cwd ?? '')
+    setNotificationsEnabled(true)
     setLoading(false)
     setError(null)
   }, [initialValues, open])
@@ -57,6 +60,7 @@ export default function NewSessionDialog({
         title: title.trim() || undefined,
         tags: parseSessionTagInput(tags),
         cwd: cwd.trim() || undefined,
+        disable_notifications: !notificationsEnabled,
         node: node ?? undefined,
       })
       onClose()
@@ -74,6 +78,7 @@ export default function NewSessionDialog({
     setTitle('')
     setTags('')
     setCwd('')
+    setNotificationsEnabled(true)
     setError(null)
   }
 
@@ -142,6 +147,10 @@ export default function NewSessionDialog({
               placeholder="/path/to/project"
             />
           </FormField>
+          <NotificationToggle
+            checked={notificationsEnabled}
+            onCheckedChange={setNotificationsEnabled}
+          />
           {error && error !== 'Command is required' ? <FormError>{error}</FormError> : null}
           <FormActions>
             <Button type="button" variant="ghost" size="sm" onClick={handleClose}>
