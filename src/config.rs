@@ -64,6 +64,9 @@ pub struct AppConfig {
     pub socket_name: String,
     pub socket_file: PathBuf,
     pub silence_seconds: u64,
+    /// Minimum seconds between repeat `input_needed` notifications for the same
+    /// session. Throttles prompt-detection spam against chatty TUIs.
+    pub notification_min_interval_seconds: u64,
     pub session_eviction_seconds: u64,
     pub max_running_sessions: usize,
     /// Rows of scrolled-off output each session's live screen parser retains
@@ -124,6 +127,7 @@ struct AppConfigOverrides {
     http_port: Option<u16>,
     log_level: Option<String>,
     silence_seconds: Option<u64>,
+    notification_min_interval_seconds: Option<u64>,
     stop_grace_seconds: Option<u64>,
     prompt_patterns: Option<Vec<String>>,
     web_push_subject: Option<String>,
@@ -151,6 +155,10 @@ impl AppConfig {
         let sessions_dir = state_dir.join("sessions");
         let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(15).max(1);
         let silence_seconds = overrides.silence_seconds.unwrap_or(10).max(1);
+        let notification_min_interval_seconds = overrides
+            .notification_min_interval_seconds
+            .unwrap_or(10)
+            .max(1);
         let stop_grace_seconds = overrides.stop_grace_seconds.unwrap_or(5).max(1);
         let http_bind = overrides
             .bind
@@ -197,6 +205,7 @@ impl AppConfig {
         Self {
             log_level,
             silence_seconds,
+            notification_min_interval_seconds,
             stop_grace_seconds,
             session_eviction_seconds,
             http_bind,
@@ -247,6 +256,9 @@ impl AppConfig {
         }
         if self.silence_seconds != other.silence_seconds {
             changed.push("silence_seconds");
+        }
+        if self.notification_min_interval_seconds != other.notification_min_interval_seconds {
+            changed.push("notification_min_interval_seconds");
         }
         if self.stop_grace_seconds != other.stop_grace_seconds {
             changed.push("stop_grace_seconds");
@@ -486,6 +498,7 @@ mod tests {
             socket_name: "test.sock".to_string(),
             socket_file: state_dir.join("daemon.sock"),
             silence_seconds: 10,
+            notification_min_interval_seconds: 10,
             session_eviction_seconds: 15,
             max_running_sessions: 50,
             screen_scrollback_rows: super::DEFAULT_SCREEN_SCROLLBACK_ROWS,
@@ -591,6 +604,41 @@ mod tests {
         assert_eq!(reloaded.notification_hook.as_deref(), Some("new-hook"));
         assert_eq!(reloaded.max_running_sessions, 7);
         assert_eq!(reloaded.silence_seconds, 10);
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn notification_min_interval_is_configurable_and_hot_reloadable() {
+        let mut base = test_config();
+        base.notification_min_interval_seconds = 10;
+        let mut changed = base.clone();
+        changed.notification_min_interval_seconds = 30;
+        assert!(
+            base.hot_reload_changes(&changed)
+                .contains(&"notification_min_interval_seconds"),
+            "changing the notify cooldown should be reported as a hot-reloadable change"
+        );
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "oly_config_notify_interval_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::write(
+            state_dir.join("config.json"),
+            r#"{"notification_min_interval_seconds": 45}"#,
+        )
+        .expect("write config.json");
+        let mut config = test_config();
+        config.state_dir = state_dir.clone();
+        let reloaded = config.try_reload().expect("reload should succeed");
+        assert_eq!(reloaded.notification_min_interval_seconds, 45);
+
+        // Absent from the file → falls back to the default, not the old value.
+        std::fs::write(state_dir.join("config.json"), r#"{}"#).expect("rewrite config.json");
+        let reloaded = config.try_reload().expect("second reload should succeed");
+        assert_eq!(reloaded.notification_min_interval_seconds, 10);
 
         let _ = std::fs::remove_dir_all(&state_dir);
     }

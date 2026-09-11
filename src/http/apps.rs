@@ -1007,6 +1007,7 @@ mod tests {
             socket_name: "test.sock".into(),
             socket_file: state_dir.join("daemon.sock"),
             silence_seconds: 10,
+            notification_min_interval_seconds: 10,
             session_eviction_seconds: 15,
             max_running_sessions: 10,
             screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
