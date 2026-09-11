@@ -250,7 +250,10 @@ impl SessionStore {
         // would orphan the files with no session referencing them, and no
         // later `oly rm` could reach them — recreating the very accumulation
         // this command exists to fix.
-        if let Ok(Some(dir)) = self.db.get_session_dir(id).await {
+        // A failure to look up the directory is itself a reason to abort: if we
+        // cannot tell where the files live, deleting the DB row would orphan
+        // them just the same. Propagate it instead of silently skipping removal.
+        if let Some(dir) = self.db.get_session_dir(id).await? {
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
