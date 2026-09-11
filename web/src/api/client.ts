@@ -19,21 +19,25 @@ import { AuthRequiredError, TooManyAttemptsError } from './types.ts'
 const BASE = '/api'
 
 // ---------------------------------------------------------------------------
-// Token storage (sessionStorage — cleared when the tab closes)
+// Token storage (localStorage — persists across tabs and browser restarts).
+// The token itself never expires server-side; it stays valid until the
+// password changes or auth is disabled, so we keep it around. The server also
+// sets a long-lived HttpOnly cookie on login: it authenticates plain document
+// navigations (e.g. /apps/<slug>/ proxy pages) that cannot send headers.
 // ---------------------------------------------------------------------------
 
 const TOKEN_KEY = 'oly_auth_token'
 
 export function getToken(): string | null {
-  return sessionStorage.getItem(TOKEN_KEY)
+  return localStorage.getItem(TOKEN_KEY)
 }
 
 export function setToken(token: string): void {
-  sessionStorage.setItem(TOKEN_KEY, token)
+  localStorage.setItem(TOKEN_KEY, token)
 }
 
 export function clearToken(): void {
-  sessionStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(TOKEN_KEY)
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +82,9 @@ export async function login(password: string): Promise<LoginResponse> {
   const res = await fetch(`${BASE}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    credentials: 'omit',
+    // Keep the default same-origin credentials mode so the browser stores the
+    // HttpOnly auth cookie from the Set-Cookie response header. Without it the
+    // cookie is dropped and document-level navigations (proxy apps) 401.
     body: JSON.stringify({ password }),
   })
   if (res.status === 429) {
@@ -104,7 +110,6 @@ export async function logout(): Promise<void> {
   await fetch(`${BASE}/auth/logout`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    credentials: 'omit',
   }).catch(() => {
     /* best effort */
   })

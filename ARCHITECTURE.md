@@ -298,7 +298,7 @@ Client                            Daemon
 
 Endpoint: `GET /api/sessions/:id/ws`
 
-Authentication: Bearer token in `Authorization` header or `?token=` query param.
+Authentication: `oly_auth_token` cookie, Bearer token in `Authorization` header, or `?token=` query param. The token is the deterministic password-derived session token (see §9 F11) and does not expire.
 
 ### Unified Streaming Architecture
 
@@ -475,11 +475,34 @@ Browser                           Daemon
   - macOS: `~/Library/Application Support/oly/`
   - Windows: `%APPDATA%\oly\`
 
-### F11 — Auth and API Keys
+### F11 — Auth, Password Login, and API Keys
 
-**Spec**: All HTTP API and WebSocket endpoints require authentication.
+**Spec**: All HTTP API and WebSocket endpoints require authentication, either
+via a password-issued session token (humans/web UI) or an API key (federation).
 
-**Requirements**:
+**Requirements — password login (web UI)**:
+- The daemon prompts for a password on first start and stores only an Argon2id
+  hash. Auth can be disabled entirely with `--no-auth`.
+- `POST /api/auth/login` verifies the password and issues a **deterministic
+  session token**: `hex(HMAC-SHA256(key = password hash, label))`.
+- The token has **no expiry** and is not kept in memory: it stays valid until
+  the password changes (new hash → new token) or auth is disabled. It survives
+  daemon restarts, so browsers do not need to re-login.
+- Because the token is derived from the password hash, every oly instance
+  configured with the same password accepts the same token. Cookies and
+  `Authorization` headers forwarded through the reverse proxy (`/apps/...`
+  proxy entries) are therefore authorized by upstream instances too — proxy
+  access and direct access share one login.
+- The token is delivered both in the login response body and as an `oly_auth_token`
+  cookie (`HttpOnly; SameSite=Lax; Max-Age=1y; Secure` when TLS is detected).
+  The cookie authenticates plain document navigations (static pages, proxied
+  apps) that cannot send headers; Bearer header and `?token=` query (WS/SSE
+  only) are accepted as alternatives.
+- Login is rate-limited per client IP: 3 failed attempts → 15-minute lockout.
+- `POST /api/auth/logout` clears the cookie. Deterministic tokens cannot be
+  revoked server-side; changing the password is the revocation mechanism.
+
+**Requirements — API keys (federation)**:
 - Initial setup creates a random admin API key.
 - Additional keys can be created/revoked via `oly key create/delete`.
 - Keys are stored hashed in SQLite.

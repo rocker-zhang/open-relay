@@ -4850,6 +4850,7 @@ dependencies = [
  "gpui",
  "gpui-terminal",
  "hkdf 0.13.0",
+ "hmac 0.13.0",
  "image",
  "interprocess",
  "libmimalloc-sys",

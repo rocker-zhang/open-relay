@@ -323,6 +323,24 @@ If `bind = "127.0.0.1"` and `auth_enabled = false`, any local process can
 control sessions.  This is intentional for trusted developer environments but
 must not be used on shared machines.
 
+### Deterministic Session Tokens (Password Auth)
+
+Session tokens are `hex(HMAC-SHA256(key = password hash, label))` — there is
+no per-session randomness, no expiry, and no in-memory token registry
+(see `src/http/auth.rs::derive_session_token`).  Consequences:
+
+- Tokens survive daemon restarts; users re-login only after a password change
+  or when auth is re-enabled after being disabled.
+- Every oly instance with the same password accepts the same token, which is
+  what makes reverse-proxy targets (`/apps/...` proxy entries) share the
+  login with the proxying instance.  Instances with *different* passwords do
+  not share logins — log in inside the proxied app instead.
+- Logout only clears the cookie; a copied token remains valid until the
+  password changes.  Rotating the password is the revocation mechanism.
+- Login attempts are still rate-limited per IP (3 failures → 15-minute lockout),
+  but token *validation* is a single constant-time HMAC comparison, so auth
+  never shows up as request latency.
+
 ---
 
 ## 3) Agent and Operator Lookup Notes

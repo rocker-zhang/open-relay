@@ -30,6 +30,24 @@ describe('session metadata helpers', () => {
     ).toEqual({ title: 'Ship it' })
   })
 
+  it('omits unchanged notifications enabled state', () => {
+    expect(
+      buildSessionMetadataUpdateSpec(
+        { title: 'Deploy', tags: ['prod'], notificationsEnabled: true },
+        { title: 'Deploy', tags: 'prod', notificationsEnabled: true }
+      )
+    ).toEqual({})
+  })
+
+  it('includes notifications enabled when toggled', () => {
+    expect(
+      buildSessionMetadataUpdateSpec(
+        { title: 'Deploy', tags: ['prod'], notificationsEnabled: true },
+        { title: 'Deploy', tags: 'prod', notificationsEnabled: false }
+      )
+    ).toEqual({ notifications_enabled: false })
+  })
+
   it('normalizes blank title input to null', () => {
     expect(normalizeSessionTitleInput('   ')).toBeNull()
   })

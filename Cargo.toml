@@ -66,6 +66,7 @@ p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 rand = "0.8"
 aes-gcm = "0.10"
 hkdf = "0.13"
+hmac = "0.13"
 sha2 = "0.11"
 base64 = "0.22"
 argon2 = "0.5"

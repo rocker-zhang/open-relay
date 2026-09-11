@@ -32,8 +32,8 @@ function sameTags(left: string[], right: string[]): boolean {
 }
 
 export function buildSessionMetadataUpdateSpec(
-  initial: { title: string | null; tags: string[] },
-  draft: { title: string; tags: string }
+  initial: { title: string | null; tags: string[]; notificationsEnabled?: boolean },
+  draft: { title: string; tags: string; notificationsEnabled?: boolean }
 ): UpdateSessionMetadataSpec {
   const next: UpdateSessionMetadataSpec = {}
 
@@ -47,6 +47,14 @@ export function buildSessionMetadataUpdateSpec(
   const nextTags = parseSessionTagInput(draft.tags)
   if (!sameTags(initialTags, nextTags)) {
     next.tags = nextTags
+  }
+
+  if (
+    draft.notificationsEnabled !== undefined &&
+    initial.notificationsEnabled !== undefined &&
+    initial.notificationsEnabled !== draft.notificationsEnabled
+  ) {
+    next.notifications_enabled = draft.notificationsEnabled
   }
 
   return next

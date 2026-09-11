@@ -51,6 +51,14 @@ const STOP_GRACE_SECONDS: u64 = 15;
 const SPARK_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const TUI_RESTORE_BYTES: &[u8] = b"\x1b[?1049l\x1b[?2026l\x1b[0m\x1b[?25h\x1b[0 q\
     \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
+/// Window title shown while the interactive session list owns the terminal.
+const LIST_WINDOW_TITLE: &str = "oly sessions";
+/// XTWINOPS 22;0 pushes the current icon + window title onto the terminal's
+/// title stack (same scheme as `terminal_guards`), so teardown can restore
+/// whatever the surrounding shell had set.
+const TITLE_SAVE_BYTES: &[u8] = b"\x1b[22;0t";
+/// XTWINOPS 23;0 pops the title saved by `TITLE_SAVE_BYTES`.
+const TITLE_RESTORE_BYTES: &[u8] = b"\x1b[23;0t";
 const CLONE_DIALOG_HELP: &str =
     " Quotes keep spaces · ←/→ cursor · Tab/Shift+Tab · Space toggle · Enter create · Esc cancel";
 const UPDATE_DIALOG_HELP: &str =
@@ -1549,13 +1557,12 @@ fn wait_for_ctrl_d() -> Result<()> {
 struct TuiTerminal {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     cleaned_up: bool,
+    title_saved: bool,
 }
 
 impl TuiTerminal {
     fn new() -> Result<Self> {
         enable_raw_mode()?;
-        #[cfg(windows)]
-        native_crash::set_tui_active(true);
         let mut stdout = io::stdout();
         if let Err(error) = execute!(stdout, EnterAlternateScreen) {
             let _ = disable_raw_mode();
@@ -1564,14 +1571,25 @@ impl TuiTerminal {
             native_crash::set_tui_active(false);
             return Err(error.into());
         }
+        // Claim the window title: push the current one onto the terminal's
+        // title stack, then set ours. `title_saved` tracks whether the push
+        // happened so teardown (and the error paths below) only pop when there
+        // is a matching entry to restore.
+        let title_saved = enter_list_title(&mut stdout).is_ok();
+        #[cfg(windows)]
+        native_crash::set_tui_active(true);
         match Terminal::new(CrosstermBackend::new(stdout)) {
             Ok(terminal) => Ok(Self {
                 terminal,
                 cleaned_up: false,
+                title_saved,
             }),
             Err(error) => {
                 let mut stdout = io::stdout();
                 let _ = disable_raw_mode();
+                if title_saved {
+                    let _ = stdout.write_all(TITLE_RESTORE_BYTES);
+                }
                 let _ = restore_tui_state(&mut stdout);
                 #[cfg(windows)]
                 native_crash::set_tui_active(false);
@@ -1603,6 +1621,10 @@ impl TuiTerminal {
     fn resume(&mut self) -> Result<()> {
         enable_raw_mode()?;
         execute!(self.terminal.backend_mut(), EnterAlternateScreen, Hide)?;
+        // Re-assert our window title. The inline child (oly attach / oly logs)
+        // may have forwarded its own OSC title, and its teardown only restores
+        // the previous one on terminals that support the XTWINOPS title stack.
+        let _ = write_list_title(self.terminal.backend_mut());
         self.terminal.clear()?;
         Ok(())
     }
@@ -1613,6 +1635,14 @@ impl TuiTerminal {
         }
 
         let mut first_error = disable_raw_mode().err();
+        if self.title_saved {
+            if let Err(error) = self.terminal.backend_mut().write_all(TITLE_RESTORE_BYTES)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            self.title_saved = false;
+        }
         if let Err(error) = restore_tui_state(self.terminal.backend_mut())
             && first_error.is_none()
         {
@@ -1641,6 +1671,23 @@ fn restore_tui_state(writer: &mut impl Write) -> io::Result<()> {
     writer.flush()
 }
 
+/// Push the current title onto the terminal's title stack and set the window
+/// title for the session list. Returns `Ok` only when the whole sequence was
+/// written, so callers know a matching restore is required.
+fn enter_list_title(writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(TITLE_SAVE_BYTES)?;
+    write_list_title(writer)?;
+    writer.flush()
+}
+
+/// OSC 0 sets both the icon and window title while the session list is on
+/// screen.
+fn write_list_title(writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(b"\x1b]0;")?;
+    writer.write_all(LIST_WINDOW_TITLE.as_bytes())?;
+    writer.write_all(b"\x07")
+}
+
 #[cfg(windows)]
 mod native_crash {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1655,7 +1702,7 @@ mod native_crash {
         },
     };
 
-    use super::TUI_RESTORE_BYTES;
+    use super::{TITLE_RESTORE_BYTES, TUI_RESTORE_BYTES};
 
     static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
     static CRASH_REPORTED: AtomicBool = AtomicBool::new(false);
@@ -1687,7 +1734,11 @@ mod native_crash {
     unsafe fn report_crash(info: *const EXCEPTION_POINTERS) {
         if TUI_ACTIVE.load(Ordering::SeqCst) && !CRASH_REPORTED.swap(true, Ordering::SeqCst) {
             unsafe {
+                // `set_tui_active(true)` is only reached after the window
+                // title was pushed onto the title stack, so the crash path can
+                // safely pop it back.
                 write_handle(STD_OUTPUT_HANDLE, TUI_RESTORE_BYTES);
+                write_handle(STD_OUTPUT_HANDLE, TITLE_RESTORE_BYTES);
                 write_handle(STD_ERROR_HANDLE, native_crash_message(info));
             }
         }
@@ -2890,7 +2941,8 @@ fn shell_quote(value: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppAction, CloneField, CloneLaunch, TUI_RESTORE_BYTES, WindowRect, arrange_window,
+        App, AppAction, CloneField, CloneLaunch, LIST_WINDOW_TITLE, TITLE_RESTORE_BYTES,
+        TITLE_SAVE_BYTES, TUI_RESTORE_BYTES, WindowRect, arrange_window, enter_list_title,
         panic_payload_message, restore_tui_state, route_key,
     };
     use crate::{
@@ -4104,6 +4156,33 @@ mod tests {
             panic_payload_message(unknown.as_ref()),
             "<non-string panic payload>"
         );
+    }
+
+    #[test]
+    fn list_title_entry_saves_then_sets_window_title() {
+        let mut output = Vec::new();
+
+        enter_list_title(&mut output).unwrap();
+
+        assert_eq!(
+            output,
+            [
+                TITLE_SAVE_BYTES,
+                b"\x1b]0;",
+                LIST_WINDOW_TITLE.as_bytes(),
+                b"\x07"
+            ]
+            .concat()
+        );
+        // The push must come first so teardown can pop back to the original.
+        assert!(output.starts_with(b"\x1b[22;0t"));
+        assert!(output.ends_with(b"\x07"));
+    }
+
+    #[test]
+    fn title_save_and_restore_are_symmetric_title_stack_ops() {
+        assert_eq!(TITLE_SAVE_BYTES, b"\x1b[22;0t");
+        assert_eq!(TITLE_RESTORE_BYTES, b"\x1b[23;0t");
     }
 
     #[test]

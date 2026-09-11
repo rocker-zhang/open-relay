@@ -84,6 +84,8 @@ export interface CreateSessionSpec {
   cwd?: string
   rows?: number
   cols?: number
+  /** Disable push notifications for this session (enabled by default). */
+  disable_notifications?: boolean
   /** If set, create the session on this connected secondary node. */
   node?: string
 }
