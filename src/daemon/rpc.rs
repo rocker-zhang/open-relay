@@ -202,6 +202,7 @@ async fn dispatch_request(
             handle_stop(id, grace_seconds, session_store).await
         }
         RpcRequest::Kill { id } => handle_kill(id, session_store).await,
+        RpcRequest::Remove { id, force } => handle_remove(id, force, session_store).await,
         RpcRequest::LogsTail {
             id,
             tail,
@@ -343,6 +344,18 @@ async fn handle_kill(id: String, session_store: &SessionStoreHandle) -> RpcRespo
         RpcResponse::Error {
             message: format!("session not found or failed to kill: {id}"),
         }
+    }
+}
+
+async fn handle_remove(id: String, force: bool, session_store: &SessionStoreHandle) -> RpcResponse {
+    match session_store.delete_session(&id, force).await {
+        Ok(true) => RpcResponse::Remove { removed: true },
+        Ok(false) => RpcResponse::Error {
+            message: format!("session not found: {id}"),
+        },
+        Err(err) => RpcResponse::Error {
+            message: err.to_string(),
+        },
     }
 }
 

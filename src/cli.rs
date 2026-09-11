@@ -69,6 +69,9 @@ pub enum Commands {
     List(ListArgs),
     /// Stop a session by ID.
     Stop(StopArgs),
+    /// Delete a session and its files. Stopped sessions are removed directly; use --force to also remove a running one.
+    #[command(name = "rm", visible_alias = "delete")]
+    Remove(RemoveArgs),
     /// Attach to a running session.
     Attach(AttachArgs),
     /// Show session logs. Use runtime screen state if session is running, or `--from-file` to render from the persisted output.log file instead.
@@ -335,6 +338,18 @@ pub struct StopArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct RemoveArgs {
+    /// Session ID to delete. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Delete even if the session is still running (it is killed first).
+    #[arg(long)]
+    pub force: bool,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct AttachArgs {
     /// Session ID to attach to. If omitted, uses the most recently created session.
     pub id: Option<String>,
@@ -499,6 +514,29 @@ mod tests {
         Cli, Commands, DaemonCommand, NotificationSetting, NotifyCommand, parse_timeout_ms,
     };
     use clap::Parser;
+
+    #[test]
+    fn rm_parses_id_force_and_node() {
+        let cli = Cli::try_parse_from(["oly", "rm", "session-1", "--force", "--node", "worker-a"])
+            .unwrap();
+        let Commands::Remove(args) = cli.command else {
+            panic!("expected remove command");
+        };
+        assert_eq!(args.id.as_deref(), Some("session-1"));
+        assert!(args.force);
+        assert_eq!(args.node.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn rm_defaults_force_off_and_accepts_alias() {
+        let cli = Cli::try_parse_from(["oly", "delete", "session-2"]).unwrap();
+        let Commands::Remove(args) = cli.command else {
+            panic!("expected remove command via delete alias");
+        };
+        assert_eq!(args.id.as_deref(), Some("session-2"));
+        assert!(!args.force);
+        assert_eq!(args.node, None);
+    }
 
     #[test]
     fn parses_timeout_units_directly() {
