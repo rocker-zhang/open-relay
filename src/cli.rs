@@ -65,11 +65,12 @@ pub enum Commands {
     /// Display the oly skill markdown.
     Skill(SkillArgs),
     /// List sessions. Order is most recently created last.
-    #[command(name = "ls")]
+    #[command(name = "ls", visible_alias = "list")]
     List(ListArgs),
     /// Stop a session by ID.
     Stop(StopArgs),
     /// Attach to a running session.
+    #[command(visible_alias = "resume")]
     Attach(AttachArgs),
     /// Show session logs. Use runtime screen state if session is running, or `--from-file` to render from the persisted output.log file instead.
     Logs(LogsArgs),
@@ -676,6 +677,23 @@ mod tests {
             panic!("expected list command");
         };
         assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
+    }
+
+    #[test]
+    fn list_alias_matches_ls() {
+        let cli = Cli::try_parse_from(["oly", "list", "--tag", "prod"]).unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command via `list` alias");
+        };
+        assert_eq!(args.tags, vec!["prod".to_string()]);
+    }
+
+    #[test]
+    fn attach_alias_matches_resume() {
+        let cli = Cli::try_parse_from(["oly", "resume", "session-1"]).unwrap();
+        let Commands::Attach(_) = cli.command else {
+            panic!("expected attach command via `resume` alias");
+        };
     }
 
     #[test]

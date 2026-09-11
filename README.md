@@ -177,11 +177,12 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly daemon start [--detach] [--bind <addr>] [--port <port>] [--no-auth] [--no-http]` | Start the daemon, optional local web API/UI |
 | `oly daemon stop [--grace <seconds>]` | Stop the daemon and let sessions exit cleanly first |
 | `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
-| `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-local]` | List sessions |
-| `oly attach [id] [--node <name>]` | Reattach to a session |
+| `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-local]` | List sessions (alias: `oly list`) |
+| `oly attach [id] [--node <name>]` | Reattach to a session (alias: `oly resume`) |
 | `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]` | Read logs without attaching |
 | `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session |
 | `oly stop [id] [--grace <seconds>] [--node <name>]` | Stop a session |
+| `oly rm [id] [--force] [--node <name>]` | Delete a stopped session and its logs (`--force` also kills a running session first) |
 | `oly notify enable [id] [--node <name>]` | Enable notifications for a session |
 | `oly notify disable [id] [--node <name>]` | Disable notifications for a session |
 | `oly skill` | Print the bundled `oly` skill markdown |
@@ -276,6 +277,16 @@ Inside that directory, `oly` stores:
 - generated default `config.json`
 - saved join configs on secondary nodes
 - optional `wwwroot` static content
+
+### Tunable `config.json` keys
+
+These keys can be set in `config.json` (runtime overrides win over the file). Several are hot-reloaded when the file changes, so no daemon restart is needed:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `silence_seconds` | `10` | Idle time before a session is considered silent for `input_needed` detection |
+| `notification_min_interval_seconds` | `10` | Minimum seconds between repeat `input_needed` notifications for the same session |
+| `max_output_log_bytes` | `0` (unlimited) | Cap on a session's `output.log`; when exceeded, the daemon safely truncates it in place |
 
 ---
 
