@@ -336,6 +336,22 @@ async fn run() -> Result<()> {
             }
         }
 
+        Commands::Remove(remove_args) => {
+            let id = resolve_session_id(&config, remove_args.id.clone(), remove_args.node.as_ref())
+                .await?;
+            let inner = RpcRequest::Remove {
+                id: id.clone(),
+                force: remove_args.force,
+            };
+            match ipc::send_request_checked(&config, node_wrap(remove_args.node, inner)).await? {
+                RpcResponse::Remove { removed } if removed => {
+                    println!("Session {id} deleted.");
+                    Ok(())
+                }
+                _ => Err(AppError::Protocol("unexpected response type".to_string())),
+            }
+        }
+
         Commands::Attach(attach_args) => {
             let id = resolve_session_id(&config, attach_args.id.clone(), attach_args.node.as_ref())
                 .await?;

@@ -223,6 +223,14 @@ pub enum RpcRequest {
     Kill {
         id: String,
     },
+    /// Delete a session: remove its DB row, on-disk directory, and any
+    /// in-memory runtime.  `force` also terminates a still-running session
+    /// before deleting; without it, a running session is rejected.
+    Remove {
+        id: String,
+        #[serde(default)]
+        force: bool,
+    },
     LogsTail {
         id: String,
         tail: usize,
@@ -295,6 +303,7 @@ impl RpcRequest {
             RpcRequest::AttachDetach { .. } => "attach_detach",
             RpcRequest::Stop { .. } => "stop",
             RpcRequest::Kill { .. } => "kill",
+            RpcRequest::Remove { .. } => "remove",
             RpcRequest::LogsTail { .. } => "logs_tail",
             RpcRequest::LogsPagination { .. } => "logs_pagination",
             RpcRequest::LogsWait { .. } => "logs_wait",
@@ -379,6 +388,9 @@ pub enum RpcResponse {
     },
     Kill {
         killed: bool,
+    },
+    Remove {
+        removed: bool,
     },
     LogsTail {
         output: Vec<u8>,

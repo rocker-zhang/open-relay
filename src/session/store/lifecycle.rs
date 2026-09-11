@@ -211,6 +211,69 @@ impl SessionStore {
         self.terminate_session(id, 0, SessionStatus::Killed).await
     }
 
+    /// Delete a session entirely: its DB row, its on-disk directory, its
+    /// in-memory runtime handle, and any eviction tombstone.
+    ///
+    /// A still-running session is only removed when `force` is set (it is
+    /// killed first); otherwise `AppError::Protocol` is returned so the caller
+    /// can surface the `--force` hint. Returns `false` when the id is unknown
+    /// (not in memory and not in the database).
+    pub async fn delete_session(&self, id: &str, force: bool) -> Result<bool> {
+        // If a live runtime exists and is still running, respect the force gate.
+        let handle = self.sessions.load().get(id).cloned();
+        if let Some(handle) = &handle {
+            let running = {
+                let mut rt = handle.write();
+                rt.refresh_status();
+                !rt.is_completed()
+            };
+            if running {
+                if !force {
+                    return Err(AppError::Protocol(format!(
+                        "session is still running: {id}. Stop it first, or pass --force to kill and delete it."
+                    )));
+                }
+                Self::terminate_runtime(id.to_string(), handle.clone(), 0, SessionStatus::Killed)
+                    .await;
+            }
+        } else if !self.db.session_exists(id).await {
+            // Not in memory and not in the DB: nothing to delete.
+            let is_tombstoned = self.mutable.lock().await.evicted_sessions.contains_key(id);
+            if !is_tombstoned {
+                return Ok(false);
+            }
+        }
+
+        // Remove the on-disk session directory (best effort).
+        if let Ok(Some(dir)) = self.db.get_session_dir(id).await
+            && let Err(err) = std::fs::remove_dir_all(&dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(session_id = id, %err, "failed to remove session directory during delete");
+        }
+
+        // Remove the DB row.
+        self.db.delete_session(id).await?;
+
+        // Drop the in-memory handle and any eviction tombstone.
+        if handle.is_some() {
+            self.sessions.rcu(|current| {
+                let mut next = (**current).clone();
+                next.remove(id);
+                next
+            });
+        }
+        self.mutable.lock().await.evicted_sessions.remove(id);
+
+        info!(session_id = id, force, "session deleted");
+        let _ = self.event_tx.send(SessionEvent::SessionDeleted {
+            id: id.to_string(),
+            node: None,
+        });
+
+        Ok(true)
+    }
+
     async fn terminate_session(
         &self,
         id: &str,
@@ -673,6 +736,101 @@ mod tests {
             rt.is_completed(),
             "killed session should be marked completed"
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_removes_stopped_session() {
+        let rt = make_runtime("del0001", SessionStatus::Stopped, "", None);
+        {
+            let mut locked = rt.write();
+            locked.meta.exit_code = Some(0);
+            locked.meta.ended_at = Some(Utc::now());
+            locked.completed_at = Some(Instant::now());
+        }
+        let db = make_test_db().await;
+        db.insert_session(&rt.read().meta).await.expect("insert");
+        let store = store_with(vec![rt], db);
+
+        // The delete path removes the canonical `<sessions_dir>/<id>` directory,
+        // so seed that (the in-memory test fixture uses an unrelated temp path).
+        let canonical_dir = store
+            .db
+            .get_session_dir("del0001")
+            .await
+            .expect("get_session_dir")
+            .expect("session dir path");
+        std::fs::create_dir_all(&canonical_dir).expect("seed session dir");
+
+        let removed = store
+            .delete_session("del0001", false)
+            .await
+            .expect("delete should succeed");
+        assert!(removed, "stopped session should be deleted");
+        assert!(
+            !store.sessions.load().contains_key("del0001"),
+            "handle should be dropped from memory"
+        );
+        assert!(
+            !store.db.session_exists("del0001").await,
+            "db row should be gone"
+        );
+        assert!(
+            !canonical_dir.exists(),
+            "canonical session directory should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_running_session_requires_force() {
+        let (rt, _writer_rx) = make_runtime_writable("del0002", SessionStatus::Running);
+        let db = make_test_db().await;
+        db.insert_session(&rt.read().meta).await.expect("insert");
+        let store = store_with(vec![rt], db);
+
+        let err = store
+            .delete_session("del0002", false)
+            .await
+            .expect_err("running session without force should error");
+        assert!(
+            matches!(err, AppError::Protocol(ref m) if m.contains("--force")),
+            "error should hint at --force, got {err:?}"
+        );
+        assert!(
+            store.sessions.load().contains_key("del0002"),
+            "running session must survive a non-forced delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_running_session_with_force_kills_and_removes() {
+        let (rt, _writer_rx) = make_runtime_writable("del0003", SessionStatus::Running);
+        let db = make_test_db().await;
+        db.insert_session(&rt.read().meta).await.expect("insert");
+        let store = store_with(vec![rt], db);
+
+        let removed = store
+            .delete_session("del0003", true)
+            .await
+            .expect("forced delete should succeed");
+        assert!(removed, "forced delete should report removal");
+        assert!(
+            !store.sessions.load().contains_key("del0003"),
+            "handle should be dropped after forced delete"
+        );
+        assert!(
+            !store.db.session_exists("del0003").await,
+            "db row should be gone after forced delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_unknown_session_returns_false() {
+        let store = store_with(vec![], make_test_db().await);
+        let removed = store
+            .delete_session("nope", false)
+            .await
+            .expect("delete of unknown id should not error");
+        assert!(!removed, "unknown id should report not-found");
     }
 
     #[tokio::test]
