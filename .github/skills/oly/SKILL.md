@@ -75,13 +75,16 @@ oly update <ID> --title ""
 oly update <ID> --tag prod --tag release
 oly update <ID> --tag ""
 oly stop <ID>
-oly ls                # oly ls --json for agents
+oly rm <ID>           # delete a stopped session + its logs; --force also kills a running one
+oly ls                # oly ls --json for agents (alias: oly list)
 ```
 
 - `oly update` changes session metadata without restarting the session.
 - `--title ""` clears the title. If `--title` is omitted, the existing title is kept.
 - `--tag ""` clears all tags. If `--tag` is omitted, existing tags are kept.
 - Repeating `--tag` replaces the full tag list with the provided tags.
+- `oly rm <ID>` deletes a stopped session's DB row and on-disk logs. Running sessions are refused unless you pass `--force` (which kills the session first).
+- `oly attach` also answers to `oly resume`; `oly ls` also answers to `oly list`.
 
 ### 5) Notify
 
