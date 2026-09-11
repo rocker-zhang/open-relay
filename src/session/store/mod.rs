@@ -34,10 +34,12 @@ pub(super) const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x1a, b'\r']
 pub(super) const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
 
 pub(super) const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// A PTY echoes back almost everything the user types, so output landing this
-/// soon after a keystroke is attributed to that keystroke instead of to the
-/// program. Anything later than this is considered self-driven program output.
-pub(super) const INPUT_ECHO_WINDOW: Duration = Duration::from_secs(1);
+/// Output landing this soon after user activity (text input, mouse
+/// click/hover, resize, attach) is attributed to that activity — keystroke
+/// echo, post-resize redraws and hover/click feedback all take a moment to
+/// settle — instead of to the program asking for attention. Anything later
+/// than this is considered self-driven program output.
+pub(super) const USER_ACTIVITY_WINDOW: Duration = Duration::from_secs(3);
 #[cfg(not(test))]
 pub(super) const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(3_000);
 #[cfg(test)]
@@ -78,7 +80,9 @@ impl SessionHandle {
 pub struct SessionStore {
     pub(super) sessions: ArcSwap<SessionMap>,
     pub(super) mutable: TokioMutex<StoreMutableState>,
-    pub(super) eviction_ttl: Duration,
+    /// TTL for evicting completed sessions, in seconds. Atomic so the
+    /// daemon's config hot-reload can adjust it without a restart.
+    pub(super) eviction_ttl_secs: std::sync::atomic::AtomicU64,
     pub(super) db: Arc<Database>,
     pub(super) event_tx: SessionEventTx,
 }
@@ -113,10 +117,24 @@ impl SessionStore {
                 starting_sessions: HashSet::new(),
                 evicted_sessions: HashMap::new(),
             }),
-            eviction_ttl: Duration::from_secs(eviction_seconds.max(1)),
+            eviction_ttl_secs: std::sync::atomic::AtomicU64::new(eviction_seconds.max(1)),
             db,
             event_tx,
         }
+    }
+
+    /// Current eviction TTL for completed sessions.
+    pub(super) fn eviction_ttl(&self) -> Duration {
+        Duration::from_secs(
+            self.eviction_ttl_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Hot-update the eviction TTL after a config reload.
+    pub fn set_eviction_seconds(&self, seconds: u64) {
+        self.eviction_ttl_secs
+            .store(seconds.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn event_tx(&self) -> SessionEventTx {

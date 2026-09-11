@@ -7,7 +7,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     client,
-    config::AppConfig,
+    config::{AppConfig, LiveConfig},
     db::Database,
     error::{AppError, Result},
     http,
@@ -44,7 +44,12 @@ impl Drop for DaemonGuard {
     }
 }
 
-fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
+/// Handle to the daemon's reloadable log-level filter; the config hot-reload
+/// task swaps in a new filter when `log_level` changes in `config.json`.
+pub(super) type LogFilterHandle =
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
+pub(super) fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
     if let Ok(filter) = std::env::var("RUST_LOG") {
         return tracing_subscriber::EnvFilter::try_new(filter)
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -183,14 +188,19 @@ pub async fn start(
     };
 
     if detach && !foreground_internal {
+        // Forward only genuine CLI flags to the detached child. Forwarding
+        // the merged (file + CLI) values would pin them as runtime overrides
+        // in the child, where they win over config.json on every hot reload
+        // and silently defeat later file edits.
+        let overrides = &config.runtime_overrides;
         let child_pid = spawn_detached(
             no_auth,
             no_http,
             auth_hash.as_deref(),
-            &config.http_bind,
-            config.http_port,
-            config.notification_hook.as_deref(),
-            config.web_push_proxy.as_deref(),
+            overrides.http_bind.as_deref(),
+            overrides.http_port,
+            overrides.notification_hook.as_deref(),
+            overrides.web_push_proxy.as_deref(),
             &config.state_dir,
         )?;
         wait_for_daemon_ready(&config, Some(child_pid), std::time::Duration::from_secs(60)).await?;
@@ -310,19 +320,72 @@ async fn wait_for_daemon_ready(
     ))
 }
 
+/// Command-line arguments for the detached daemon child.
+///
+/// Only genuine CLI overrides are forwarded: anything the child receives as
+/// a flag becomes a runtime override that wins over `config.json` on every
+/// hot reload, so forwarding merged (file + CLI) values would silently pin
+/// them and defeat later file edits. Everything else is read from
+/// `config.json` by the child itself.
+fn detached_child_args(
+    bind: Option<&str>,
+    port: Option<u16>,
+    notification_hook: Option<&str>,
+    web_push_proxy: Option<&str>,
+    no_auth: bool,
+    no_http: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "daemon".to_string(),
+        "start".to_string(),
+        "--foreground-internal".to_string(),
+    ];
+    if let Some(bind) = bind {
+        args.push("--bind".to_string());
+        args.push(bind.to_string());
+    }
+    if let Some(port) = port {
+        args.push("--port".to_string());
+        args.push(port.to_string());
+    }
+    if no_auth {
+        args.push("--no-auth".to_string());
+    }
+    if no_http {
+        args.push("--no-http".to_string());
+    }
+    if let Some(notification_hook) = notification_hook {
+        args.push("--notification-hook".to_string());
+        args.push(notification_hook.to_string());
+    }
+    if let Some(web_push_proxy) = web_push_proxy {
+        args.push("--web-push-proxy".to_string());
+        args.push(web_push_proxy.to_string());
+    }
+    args
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_detached(
     no_auth: bool,
     no_http: bool,
     auth_hash: Option<&str>,
-    bind: &str,
-    port: u16,
+    bind: Option<&str>,
+    port: Option<u16>,
     notification_hook: Option<&str>,
     web_push_proxy: Option<&str>,
     state_dir: &Path,
 ) -> Result<u32> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
+    cmd.args(detached_child_args(
+        bind,
+        port,
+        notification_hook,
+        web_push_proxy,
+        no_auth,
+        no_http,
+    ));
 
     // The detached child has no console and nobody reads its stdout/stderr,
     // so historically `Stdio::null()` silently discarded everything the
@@ -343,14 +406,7 @@ fn spawn_detached(
         .map(Stdio::from)
         .unwrap_or_else(|_| Stdio::null());
 
-    cmd.arg("daemon")
-        .arg("start")
-        .arg("--foreground-internal")
-        .arg("--bind")
-        .arg(bind)
-        .arg("--port")
-        .arg(port.to_string())
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr_file);
 
@@ -360,24 +416,13 @@ fn spawn_detached(
         cmd.env("RUST_BACKTRACE", "1");
     }
 
-    if no_auth {
-        cmd.arg("--no-auth");
-    } else if let Some(hash) = auth_hash {
+    if !no_auth && let Some(hash) = auth_hash {
         // Pass the Argon2 hash via an environment variable instead of a CLI
         // argument.  CLI args are visible to all local users via `ps aux` /
         // `/proc/<pid>/cmdline`, which would leak the PHC hash.
         cmd.env("OLY_AUTH_HASH_INTERNAL", hash);
     }
 
-    if no_http {
-        cmd.arg("--no-http");
-    }
-    if let Some(notification_hook) = notification_hook {
-        cmd.arg("--notification-hook").arg(notification_hook);
-    }
-    if let Some(web_push_proxy) = web_push_proxy {
-        cmd.arg("--web-push-proxy").arg(web_push_proxy);
-    }
     // On Windows the spawned process must be placed in its own process group
     // and detached from the parent console.  Without these flags the daemon
     // stays in the same console process group as the launching terminal; closing
@@ -457,10 +502,13 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         .without_time()
         .with_target(false);
 
-    let env_filter = build_env_filter(&config);
+    // Reloadable filter layer: the config hot-reload task swaps in a new
+    // EnvFilter when `log_level` changes in config.json.
+    let (env_filter_layer, log_filter_handle) =
+        tracing_subscriber::reload::Layer::new(build_env_filter(&config));
 
     tracing_subscriber::registry()
-        .with(env_filter)
+        .with(env_filter_layer)
         .with(file_layer)
         .with(stderr_layer)
         .init();
@@ -517,14 +565,20 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         info!(count, "join connectors initialized");
     }
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
-    let notifier: NotifierHandle =
-        Arc::new(crate::notification::build_notifier(db.clone(), &config));
+    let notifier: NotifierHandle = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::notification::build_notifier(db.clone(), &config),
+    ));
+
+    // Shared live view of the configuration. The hot-reload task swaps in a
+    // rebuilt AppConfig when config.json changes on disk; subsystems read
+    // through this to pick up hot-reloadable settings without a restart.
+    let live_config = LiveConfig::from_arc(Arc::clone(&config));
 
     let auth_state = auth_hash.map(AuthState::new);
     if !no_http {
         let http_state = http::AppState {
             store: session_store.clone(),
-            config: Arc::clone(&config),
+            config: live_config.clone(),
             db: db.clone(),
             notifier: notifier.clone(),
             event_tx: event_tx.clone(),
@@ -538,7 +592,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     }
 
     let notify_store = session_store.clone();
-    let notify_config = Arc::clone(&config);
+    let notify_config = live_config.clone();
     let notify_event_tx = event_tx.clone();
     let notify_notification_tx = notification_tx.clone();
     let notify_notifier = notifier.clone();
@@ -554,10 +608,28 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     });
     info!("notification monitor task spawned");
 
+    {
+        let reload_config = live_config.clone();
+        let reload_store = session_store.clone();
+        let reload_notifier = notifier.clone();
+        let reload_db = db.clone();
+        tokio::spawn(async move {
+            super::reload::run_config_reloader(
+                reload_config,
+                reload_store,
+                reload_notifier,
+                reload_db,
+                log_filter_handle,
+            )
+            .await;
+        });
+        info!("config hot-reload task spawned");
+    }
+
     if !startup_failed_sessions.is_empty() {
         let notifier = notifier.clone();
         let event = NotificationEvent::startup_recovery(&startup_failed_sessions);
-        let outcome = notifier.dispatch(&event).await;
+        let outcome = notifier.load_full().dispatch(&event).await;
 
         if outcome.any_delivered() {
             info!(
@@ -599,6 +671,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                 match incoming {
                     Ok(stream) => {
                         let config_clone = Arc::clone(&config);
+                        let live_config_clone = live_config.clone();
                         let store_clone = session_store.clone();
                         let shutdown_tx_clone = shutdown_tx.clone();
                         let registry_clone = node_registry.clone();
@@ -611,6 +684,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                             if let Err(err) = handle_client(
                                 stream,
                                 config_clone,
+                                live_config_clone,
                                 store_clone,
                                 shutdown_tx_clone,
                                 registry_clone,
@@ -664,9 +738,48 @@ mod tests {
             silence_seconds: 10,
             session_eviction_seconds: 15,
             max_running_sessions: 50,
+            screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             notification_hook: None,
             web_push_proxy: None,
+            runtime_overrides: Default::default(),
         }
+    }
+
+    #[test]
+    fn detached_child_args_forward_only_explicit_cli_overrides() {
+        // Regression: merged config values (e.g. notification_hook loaded
+        // from config.json) must NOT be forwarded as CLI flags — they would
+        // become runtime overrides in the child and pin the value against
+        // later config.json edits, silently defeating hot reload.
+        let args = super::detached_child_args(None, None, None, None, false, false);
+        assert_eq!(args, ["daemon", "start", "--foreground-internal"]);
+
+        let args = super::detached_child_args(
+            Some("0.0.0.0"),
+            Some(17000),
+            Some("pwsh -File C:\\hooks\\notify.ps1"),
+            Some("socks5://127.0.0.1:1080"),
+            true,
+            true,
+        );
+        assert_eq!(
+            args,
+            [
+                "daemon",
+                "start",
+                "--foreground-internal",
+                "--bind",
+                "0.0.0.0",
+                "--port",
+                "17000",
+                "--no-auth",
+                "--no-http",
+                "--notification-hook",
+                "pwsh -File C:\\hooks\\notify.ps1",
+                "--web-push-proxy",
+                "socks5://127.0.0.1:1080",
+            ]
+        );
     }
 
     #[test]

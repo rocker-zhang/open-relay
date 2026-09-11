@@ -121,6 +121,25 @@ impl SessionStore {
         ))
     }
 
+    /// Render the session's scrolled-off rows — at most `rows`, the attaching
+    /// client's screen height — for the client to print before the screen
+    /// snapshot, so the terminal scrollbar covers pre-attach history instead
+    /// of starting empty.  The visible screen is deliberately excluded: the
+    /// snapshot already covers it, and seeding it would duplicate content.
+    ///
+    /// Returns `None` when there is nothing worth seeding: the session is in
+    /// the alternate screen (rows that scrolled off there are not linear
+    /// history) or nothing has scrolled off yet.
+    pub async fn attach_scrollback_seed(&self, id: &str, rows: u16) -> Option<Vec<u8>> {
+        let handle = self.lookup_runtime(id).await.ok()?;
+        let rt = handle.read();
+        let screen = rt.screen_parser.screen();
+        if screen.alternate_screen() {
+            return None;
+        }
+        crate::session::logs::render_screen_history(screen, usize::from(rows))
+    }
+
     /// Subscribe to resize notifications for a session.
     /// Returns a broadcast receiver for (rows, cols) events and the current PTY size.
     pub fn subscribe_resize(
@@ -532,7 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_attach_detach_clears_presence_and_activity() {
+    async fn test_attach_detach_clears_presence_but_keeps_activity() {
         let rt = make_runtime("detach001", SessionStatus::Running, "$ prompt", None);
         let rt_clone = rt.clone();
         let store = store_with(vec![rt], make_test_db().await);
@@ -550,8 +569,8 @@ mod tests {
 
         let locked = rt_clone.read();
         assert!(
-            locked.last_attach_activity_at.is_none(),
-            "detach should clear attach activity"
+            locked.last_attach_activity_at.is_some(),
+            "detach must keep the activity timestamp: it records when a user last saw the session"
         );
     }
 
@@ -593,8 +612,8 @@ mod tests {
         let locked = rt_clone.read();
         assert_eq!(locked.attach_count, 0, "all clients should be disconnected");
         assert!(
-            locked.last_attach_activity_at.is_none(),
-            "final detach should clear attach activity"
+            locked.last_attach_activity_at.is_some(),
+            "final detach should still keep the last-seen activity timestamp"
         );
     }
 
@@ -617,5 +636,60 @@ mod tests {
             "fresh test runtime should still have open output"
         );
         assert_eq!(exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn attach_scrollback_seed_renders_scrolled_off_rows_only() {
+        // 30 lines on a 24-row screen: only the first rows live in the
+        // parser's retained scrollback; the rest are still visible.
+        let mut excerpt = String::new();
+        for i in 1..=30 {
+            excerpt.push_str(&format!("history line {i:02}\r\n"));
+        }
+        let rt = make_runtime("seedhist", SessionStatus::Running, &excerpt, None);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let seed = store
+            .attach_scrollback_seed("seedhist", 24)
+            .await
+            .expect("session with scrollback should render a seed");
+        let text = String::from_utf8_lossy(&seed);
+        assert!(text.contains("history line 01"));
+        assert!(text.contains("history line 07"));
+        // The visible screen is covered by the attach snapshot, not the seed.
+        assert!(!text.contains("history line 08"));
+        assert!(!text.contains("history line 30"));
+    }
+
+    #[tokio::test]
+    async fn attach_scrollback_seed_is_none_when_nothing_scrolled_off() {
+        let rt = make_runtime(
+            "seedrows",
+            SessionStatus::Running,
+            "seeded line one\nseeded line two\n",
+            None,
+        );
+        let store = store_with(vec![rt], make_test_db().await);
+
+        assert!(store.attach_scrollback_seed("seedrows", 24).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_scrollback_seed_skips_alternate_screen_sessions() {
+        let rt = make_runtime("seedalt", SessionStatus::Running, "plain\n", None);
+        rt.write()
+            .screen_parser
+            .process(b"\x1b[?1049h\x1b[2J\x1b[Htui");
+        let store = store_with(vec![rt], make_test_db().await);
+
+        assert!(store.attach_scrollback_seed("seedalt", 24).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_scrollback_seed_is_none_without_content_rows() {
+        let rt = make_runtime("seednone", SessionStatus::Running, "", None);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        assert!(store.attach_scrollback_seed("seednone", 24).await.is_none());
     }
 }

@@ -88,8 +88,14 @@ impl SessionStore {
             notifications_enabled,
         } = prepared;
         let session_id = meta.id.clone();
-        let runtime = match spawn_session(&mut meta, session_dir, rows, cols, notifications_enabled)
-        {
+        let runtime = match spawn_session(
+            &mut meta,
+            session_dir,
+            rows,
+            cols,
+            notifications_enabled,
+            config.screen_scrollback_rows,
+        ) {
             Ok(runtime) => runtime,
             Err(err) => {
                 let _ = store_handle.abort_started_session(&session_id).await;
@@ -406,7 +412,7 @@ impl SessionStore {
                     rt.completed_at = Some(now);
                     continue;
                 };
-                if now.duration_since(completed_at) >= self.eviction_ttl {
+                if now.duration_since(completed_at) >= self.eviction_ttl() {
                     tracing::info!(
                         session_id = id,
                         age_seconds = now.duration_since(completed_at).as_secs(),
@@ -439,12 +445,12 @@ impl SessionStore {
                 debug!(session_id = %id, "session evicted from in-memory store");
                 state.evicted_sessions.insert(id, now);
             }
-            Self::evict_old_tombstones(&mut state.evicted_sessions, now, self.eviction_ttl);
+            Self::evict_old_tombstones(&mut state.evicted_sessions, now, self.eviction_ttl());
             return;
         }
 
         let mut state = self.mutable.lock().await;
-        Self::evict_old_tombstones(&mut state.evicted_sessions, now, self.eviction_ttl);
+        Self::evict_old_tombstones(&mut state.evicted_sessions, now, self.eviction_ttl());
     }
 
     fn evict_old_tombstones(
