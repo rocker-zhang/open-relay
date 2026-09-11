@@ -244,12 +244,21 @@ impl SessionStore {
             }
         }
 
-        // Remove the on-disk session directory (best effort).
-        if let Ok(Some(dir)) = self.db.get_session_dir(id).await
-            && let Err(err) = std::fs::remove_dir_all(&dir)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(session_id = id, %err, "failed to remove session directory during delete");
+        // Remove the on-disk session directory first. If this fails for a
+        // real reason (permissions, EBUSY, read-only mount), abort before
+        // touching the DB row: deleting the row while the directory survives
+        // would orphan the files with no session referencing them, and no
+        // later `oly rm` could reach them — recreating the very accumulation
+        // this command exists to fix.
+        if let Ok(Some(dir)) = self.db.get_session_dir(id).await {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    warn!(session_id = id, %err, "failed to remove session directory during delete");
+                    return Err(AppError::Io(err));
+                }
+            }
         }
 
         // Remove the DB row.
@@ -831,6 +840,49 @@ mod tests {
             .await
             .expect("delete of unknown id should not error");
         assert!(!removed, "unknown id should report not-found");
+    }
+
+    #[tokio::test]
+    async fn test_delete_aborts_and_keeps_row_when_dir_removal_fails() {
+        let rt = make_runtime("del0004", SessionStatus::Stopped, "", None);
+        {
+            let mut locked = rt.write();
+            locked.meta.exit_code = Some(0);
+            locked.meta.ended_at = Some(Utc::now());
+            locked.completed_at = Some(Instant::now());
+        }
+        let db = make_test_db().await;
+        db.insert_session(&rt.read().meta).await.expect("insert");
+        let store = store_with(vec![rt], db);
+
+        // Seed the canonical `<sessions_dir>/<id>` path as a regular FILE, so
+        // `remove_dir_all` fails with a non-NotFound error and the delete must
+        // abort before removing the DB row.
+        let canonical = store
+            .db
+            .get_session_dir("del0004")
+            .await
+            .expect("get_session_dir")
+            .expect("session dir path");
+        if let Some(parent) = canonical.parent() {
+            std::fs::create_dir_all(parent).expect("create sessions dir");
+        }
+        std::fs::write(&canonical, b"not a directory").expect("seed file at dir path");
+
+        let err = store
+            .delete_session("del0004", false)
+            .await
+            .expect_err("delete should fail when the session dir cannot be removed");
+        assert!(
+            matches!(err, AppError::Io(_)),
+            "dir-removal failure should surface as an I/O error, got {err:?}"
+        );
+        assert!(
+            store.db.session_exists("del0004").await,
+            "DB row must survive when the directory could not be removed"
+        );
+
+        let _ = std::fs::remove_file(&canonical);
     }
 
     #[tokio::test]
