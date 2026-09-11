@@ -32,7 +32,6 @@ pub(super) async fn run_notification_monitor(
     notification_tx: tokio::sync::broadcast::Sender<NotificationEvent>,
 ) {
     let suppression_window = std::time::Duration::from_secs(5);
-    let min_notification_interval = std::time::Duration::from_secs(10);
 
     // Prompt patterns are cached compiled and rebuilt whenever a config hot
     // reload swaps in a different source list.
@@ -41,7 +40,7 @@ pub(super) async fn run_notification_monitor(
 
     info!(
         silence_seconds = config.get().silence_seconds,
-        min_notification_interval_seconds = min_notification_interval.as_secs(),
+        min_notification_interval_seconds = config.get().notification_min_interval_seconds,
         prompt_patterns = patterns.len(),
         "notification monitor started"
     );
@@ -53,6 +52,8 @@ pub(super) async fn run_notification_monitor(
         // window, prompt patterns) apply without a daemon restart.
         let current_config = config.get();
         let silence = std::time::Duration::from_secs(current_config.silence_seconds);
+        let min_notification_interval =
+            std::time::Duration::from_secs(current_config.notification_min_interval_seconds);
         if current_config.prompt_patterns != cached_pattern_sources {
             cached_pattern_sources = current_config.prompt_patterns.clone();
             patterns = compile_prompt_patterns(&cached_pattern_sources);
