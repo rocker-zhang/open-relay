@@ -200,14 +200,15 @@ impl SessionStore {
         let live_handle = store_handle.sessions.load().get(source_id).cloned();
         let (source, needs_termination) = if let Some(handle) = live_handle.as_ref() {
             let mut runtime = handle.write();
+            // Restarting a session that is still being created is never allowed,
+            // regardless of what refresh_status observes about the child process.
+            if runtime.meta.status == SessionStatus::Created {
+                return Err(AppError::Protocol(format!(
+                    "session is still being created and cannot be restarted: {source_id}"
+                )));
+            }
             runtime.refresh_status();
-            let status = runtime.meta.status;
-            match status {
-                SessionStatus::Created => {
-                    return Err(AppError::Protocol(format!(
-                        "session is still being created and cannot be restarted: {source_id}"
-                    )));
-                }
+            match runtime.meta.status {
                 SessionStatus::Running | SessionStatus::Stopping if !force => {
                     return Err(AppError::Protocol(format!(
                         "session is still running: {source_id}. Stop it first, or pass --force to kill it before restarting."
@@ -216,6 +217,13 @@ impl SessionStore {
                 SessionStatus::Running | SessionStatus::Stopping => (runtime.meta.clone(), true),
                 SessionStatus::Stopped | SessionStatus::Killed | SessionStatus::Failed => {
                     (runtime.meta.clone(), false)
+                }
+                SessionStatus::Created => {
+                    // `refresh_status` didn't advance the status; treat as
+                    // still-being-created and reject.
+                    return Err(AppError::Protocol(format!(
+                        "session is still being created and cannot be restarted: {source_id}"
+                    )));
                 }
             }
         } else {
@@ -379,7 +387,7 @@ impl SessionStore {
     pub(super) async fn abort_started_session(&self, id: &str) -> Result<()> {
         self.mutable.lock().await.starting_sessions.remove(id);
         if let Some(dir) = self.db.get_session_dir(id).await? {
-            match std::fs::remove_dir_all(dir) {
+            match tokio::fs::remove_dir_all(&dir).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(remove_err) => {
@@ -404,7 +412,30 @@ impl SessionStore {
                 }
             }
         }
-        self.db.delete_session(id).await
+        match self.db.delete_session(id).await {
+            Ok(()) => Ok(()),
+            Err(persist_err) => {
+                // Directory was removed but the row survived. Mark it Failed
+                // so it does not look like a live process and can be cleaned
+                // up by maintenance / a retry.
+                let mark_failed = async {
+                    if let Some(mut meta) = self.db.get_session(id).await? {
+                        meta.status = SessionStatus::Failed;
+                        meta.pid = None;
+                        meta.ended_at = Some(Utc::now());
+                        self.db.update_session(&meta).await?;
+                    }
+                    Ok::<(), AppError>(())
+                }
+                .await;
+                match mark_failed {
+                    Ok(()) => Err(persist_err),
+                    Err(mark_err) => Err(AppError::Protocol(format!(
+                        "deleted session directory but failed to delete DB row for {id}: {persist_err}; additionally failed to mark it failed: {mark_err}"
+                    ))),
+                }
+            }
+        }
     }
 
     pub async fn stop_session(&self, id: &str, grace_seconds: u64) -> bool {
@@ -464,7 +495,7 @@ impl SessionStore {
         // cannot tell where the files live, deleting the DB row would orphan
         // them just the same. Propagate it instead of silently skipping removal.
         if let Some(dir) = self.db.get_session_dir(id).await? {
-            match std::fs::remove_dir_all(&dir) {
+            match tokio::fs::remove_dir_all(&dir).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
