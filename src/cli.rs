@@ -65,15 +65,14 @@ pub enum Commands {
     /// Display the oly skill markdown.
     Skill(SkillArgs),
     /// List sessions. Order is most recently created last.
-    #[command(name = "ls", visible_alias = "list")]
+    #[command(name = "ls")]
     List(ListArgs),
     /// Stop a session by ID.
     Stop(StopArgs),
     /// Delete a session and its files. Stopped sessions are removed directly; use --force to also remove a running one.
-    #[command(name = "rm", visible_alias = "delete")]
+    #[command(name = "rm")]
     Remove(RemoveArgs),
     /// Attach to a running session.
-    #[command(visible_alias = "resume")]
     Attach(AttachArgs),
     /// Show session logs. Use runtime screen state if session is running, or `--from-file` to render from the persisted output.log file instead.
     Logs(LogsArgs),
@@ -529,14 +528,20 @@ mod tests {
     }
 
     #[test]
-    fn rm_defaults_force_off_and_accepts_alias() {
-        let cli = Cli::try_parse_from(["oly", "delete", "session-2"]).unwrap();
-        let Commands::Remove(args) = cli.command else {
-            panic!("expected remove command via delete alias");
-        };
-        assert_eq!(args.id.as_deref(), Some("session-2"));
-        assert!(!args.force);
-        assert_eq!(args.node, None);
+    fn removed_command_aliases_are_rejected() {
+        for argv in [
+            &["oly", "list"][..],
+            &["oly", "resume", "session-1"][..],
+            &["oly", "delete", "session-2"][..],
+        ] {
+            let err = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "removed alias `{}` should not parse",
+                argv[1]
+            );
+        }
     }
 
     #[test]
@@ -715,23 +720,6 @@ mod tests {
             panic!("expected list command");
         };
         assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
-    }
-
-    #[test]
-    fn list_alias_matches_ls() {
-        let cli = Cli::try_parse_from(["oly", "list", "--tag", "prod"]).unwrap();
-        let Commands::List(args) = cli.command else {
-            panic!("expected list command via `list` alias");
-        };
-        assert_eq!(args.tags, vec!["prod".to_string()]);
-    }
-
-    #[test]
-    fn attach_alias_matches_resume() {
-        let cli = Cli::try_parse_from(["oly", "resume", "session-1"]).unwrap();
-        let Commands::Attach(_) = cli.command else {
-            panic!("expected attach command via `resume` alias");
-        };
     }
 
     #[test]

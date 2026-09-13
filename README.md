@@ -177,8 +177,8 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly daemon start [--detach] [--bind <addr>] [--port <port>] [--no-auth] [--no-http]` | Start the daemon, optional local web API/UI |
 | `oly daemon stop [--grace <seconds>]` | Stop the daemon and let sessions exit cleanly first |
 | `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
-| `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-local]` | List sessions (alias: `oly list`) |
-| `oly attach [id] [--node <name>]` | Reattach to a session (alias: `oly resume`) |
+| `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-local]` | List sessions |
+| `oly attach [id] [--node <name>]` | Reattach to a session |
 | `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]` | Read logs without attaching |
 | `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session |
 | `oly stop [id] [--grace <seconds>] [--node <name>]` | Stop a session |
