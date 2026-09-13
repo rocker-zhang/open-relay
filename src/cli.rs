@@ -529,10 +529,17 @@ mod tests {
 
     #[test]
     fn removed_command_aliases_are_rejected() {
-        for alias in ["list", "resume", "delete"] {
-            assert!(
-                Cli::try_parse_from(["oly", alias]).is_err(),
-                "removed alias `{alias}` should not parse"
+        for argv in [
+            &["oly", "list"][..],
+            &["oly", "resume", "session-1"][..],
+            &["oly", "delete", "session-2"][..],
+        ] {
+            let err = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "removed alias `{}` should not parse",
+                argv[1]
             );
         }
     }
