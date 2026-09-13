@@ -61,11 +61,17 @@ pub(super) struct StoreMutableState {
 
 pub(super) struct SessionHandle {
     pub(super) runtime: Arc<RwLock<SessionRuntime>>,
+    /// Serializes runtime metadata changes with their SQLite persistence so an
+    /// older asynchronous write cannot overwrite a newer value.
+    pub(super) persistence: TokioMutex<()>,
 }
 
 impl SessionHandle {
     pub(super) fn new(runtime: Arc<RwLock<SessionRuntime>>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            persistence: TokioMutex::new(()),
+        }
     }
 
     pub(super) fn read(&self) -> parking_lot::RwLockReadGuard<'_, SessionRuntime> {

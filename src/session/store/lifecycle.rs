@@ -30,6 +30,19 @@ use super::{
     log_soft_stop_send,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationOutcome {
+    CompletedNaturally,
+    Terminated,
+    Failed,
+}
+
+impl TerminationOutcome {
+    fn succeeded(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
 impl SessionStore {
     /// Persist and evict completed sessions that have aged past the in-memory
     /// retention window, and cap oversized live output logs.
@@ -142,28 +155,38 @@ impl SessionStore {
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
-                let _ = store_handle.abort_started_session(&session_id).await;
-                return Err(err);
+                return match store_handle.abort_started_session(&session_id).await {
+                    Ok(()) => Err(err),
+                    Err(cleanup) => Err(AppError::Protocol(format!(
+                        "{err}; additionally failed to clean up partial session {session_id}: {cleanup}"
+                    ))),
+                };
             }
         };
         let cleanup_runtime = Arc::clone(&runtime);
 
         let result = store_handle.commit_started_session(meta, runtime).await;
 
-        if result.is_err() {
+        if let Err(err) = result {
             {
                 let mut rt = cleanup_runtime.write();
                 let _ = rt.pty.kill();
                 rt.mark_completed(SessionStatus::Failed, None);
             }
-            let _ = store_handle.abort_started_session(&session_id).await;
-        } else if let Some(summary) = store_handle.get_summary(&session_id) {
+            return match store_handle.abort_started_session(&session_id).await {
+                Ok(()) => Err(err),
+                Err(cleanup) => Err(AppError::Protocol(format!(
+                    "{err}; additionally failed to clean up partial session {session_id}: {cleanup}"
+                ))),
+            };
+        }
+        if let Some(summary) = store_handle.get_summary(&session_id) {
             let _ = store_handle
                 .event_tx
                 .send(SessionEvent::SessionCreated(summary));
         }
 
-        result
+        Ok(session_id)
     }
 
     /// Create a fresh session from a source session's persisted launch metadata.
@@ -233,11 +256,12 @@ impl SessionStore {
             }
         }
 
-        if needs_termination {
+        let termination_outcome = if needs_termination {
             let handle = live_handle.expect("live source handle checked above");
-            if !Self::terminate_runtime(source_id.to_string(), handle, 0, SessionStatus::Killed)
-                .await
-            {
+            let outcome =
+                Self::terminate_runtime(source_id.to_string(), handle, 0, SessionStatus::Killed)
+                    .await;
+            if !outcome.succeeded() {
                 return Err(AppError::Protocol(format!(
                     "failed to kill source session before restart: {source_id}"
                 )));
@@ -247,7 +271,10 @@ impl SessionStore {
                     .event_tx
                     .send(SessionEvent::SessionUpdated(summary));
             }
-        }
+            Some(outcome)
+        } else {
+            None
+        };
 
         let spec = StartSpec {
             title: source.title,
@@ -261,10 +288,15 @@ impl SessionStore {
         };
         match Self::start_session_via_handle(store_handle, config, spec).await {
             Ok(session_id) => Ok(session_id),
-            Err(err) if needs_termination => Err(AppError::Protocol(format!(
-                "source session {source_id} was killed, but its replacement failed to start: {err}"
-            ))),
-            Err(err) => Err(err),
+            Err(err) => match termination_outcome {
+                Some(TerminationOutcome::Terminated) => Err(AppError::Protocol(format!(
+                    "source session {source_id} was killed, but its replacement failed to start: {err}"
+                ))),
+                Some(TerminationOutcome::CompletedNaturally) => Err(AppError::Protocol(format!(
+                    "source session {source_id} completed before termination, but its replacement failed to start: {err}"
+                ))),
+                _ => Err(err),
+            },
         }
     }
 
@@ -350,7 +382,26 @@ impl SessionStore {
             match std::fs::remove_dir_all(dir) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(AppError::Io(err)),
+                Err(remove_err) => {
+                    // Keep a reachable record when files cannot be removed, but
+                    // never leave a failed start looking like a live process.
+                    let mark_failed = async {
+                        if let Some(mut meta) = self.db.get_session(id).await? {
+                            meta.status = SessionStatus::Failed;
+                            meta.pid = None;
+                            meta.ended_at = Some(Utc::now());
+                            self.db.update_session(&meta).await?;
+                        }
+                        Ok::<(), AppError>(())
+                    }
+                    .await;
+                    return match mark_failed {
+                        Ok(()) => Err(AppError::Io(remove_err)),
+                        Err(persist_err) => Err(AppError::Protocol(format!(
+                            "failed to remove partial session {id}: {remove_err}; additionally failed to mark it failed: {persist_err}"
+                        ))),
+                    };
+                }
             }
         }
         self.db.delete_session(id).await
@@ -387,8 +438,13 @@ impl SessionStore {
                         "session is still running: {id}. Stop it first, or pass --force to kill and delete it."
                     )));
                 }
-                Self::terminate_runtime(id.to_string(), handle.clone(), 0, SessionStatus::Killed)
-                    .await;
+                let _ = Self::terminate_runtime(
+                    id.to_string(),
+                    handle.clone(),
+                    0,
+                    SessionStatus::Killed,
+                )
+                .await;
             }
         } else if !self.db.session_exists(id).await {
             // Not in memory and not in the DB: nothing to delete.
@@ -461,7 +517,8 @@ impl SessionStore {
             grace_seconds,
             requested_final_status,
         )
-        .await;
+        .await
+        .succeeded();
 
         if terminated {
             if let Some(summary) = self.get_summary(id) {
@@ -477,7 +534,7 @@ impl SessionStore {
         handle: Arc<SessionHandle>,
         grace_seconds: u64,
         requested_final_status: SessionStatus,
-    ) -> bool {
+    ) -> TerminationOutcome {
         let grace = Duration::from_secs(grace_seconds);
         let start = Instant::now();
         let deadline = start + grace;
@@ -503,7 +560,7 @@ impl SessionStore {
                     exit_code = ?rt.meta.exit_code,
                     "session already completed before termination started"
                 );
-                return true;
+                return TerminationOutcome::CompletedNaturally;
             }
             rt.requested_final_status = Some(requested_final_status);
             rt.meta.status = SessionStatus::Stopping;
@@ -534,7 +591,7 @@ impl SessionStore {
                         exit_code = ?rt.meta.exit_code,
                         "session exited during grace window"
                     );
-                    return true;
+                    return TerminationOutcome::CompletedNaturally;
                 }
             }
             // Read lock: send any due staged soft-stop inputs.
@@ -558,38 +615,51 @@ impl SessionStore {
             tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
         }
 
-        let mut rt = handle.write();
-        if rt.refresh_status() {
-            info!(
+        {
+            let mut rt = handle.write();
+            if rt.refresh_status() {
+                info!(
+                    session_id = %session_id,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    status = rt.meta.status.as_str(),
+                    exit_code = ?rt.meta.exit_code,
+                    "session exited at grace deadline"
+                );
+                return TerminationOutcome::CompletedNaturally;
+            }
+            debug!(
                 session_id = %session_id,
-                elapsed_ms = start.elapsed().as_millis(),
-                status = rt.meta.status.as_str(),
-                exit_code = ?rt.meta.exit_code,
-                "session exited at grace deadline"
+                requested_final_status = requested_final_status.as_str(),
+                grace_seconds,
+                "session did not stop within grace window; forcing termination"
             );
-            return true;
+            if rt.pty.kill().is_err() {
+                warn!(session_id = %session_id, "failed to force terminate session process");
+                return TerminationOutcome::Failed;
+            }
         }
-        debug!(
-            session_id = %session_id,
-            requested_final_status = requested_final_status.as_str(),
-            grace_seconds,
-            "session did not stop within grace window; forcing termination"
-        );
-        if rt.pty.kill().is_ok() {
-            let _ = rt.refresh_status();
-            info!(
-                session_id = %session_id,
-                status = rt.meta.status.as_str(),
-                exit_code = ?rt.meta.exit_code,
-                "forced termination completed"
-            );
-            true
-        } else {
-            warn!(
-                session_id = %session_id,
-                "failed to force terminate session process"
-            );
-            false
+
+        // `kill` only requests termination on some platforms. Confirm the child
+        // has actually exited before allowing a replacement to consume capacity.
+        let kill_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let mut rt = handle.write();
+                if rt.refresh_status() {
+                    info!(
+                        session_id = %session_id,
+                        status = rt.meta.status.as_str(),
+                        exit_code = ?rt.meta.exit_code,
+                        "forced termination completed"
+                    );
+                    return TerminationOutcome::Terminated;
+                }
+            }
+            if Instant::now() >= kill_deadline {
+                warn!(session_id = %session_id, "timed out waiting for forced termination");
+                return TerminationOutcome::Failed;
+            }
+            tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
         }
     }
 
@@ -610,7 +680,7 @@ impl SessionStore {
         }))
         .await;
 
-        let stopped_count = results.iter().filter(|stopped| **stopped).count();
+        let stopped_count = results.iter().filter(|outcome| outcome.succeeded()).count();
 
         info!(
             stopped_count,
@@ -618,7 +688,7 @@ impl SessionStore {
             grace_seconds,
             "completed stop-all session termination pass"
         );
-        results.into_iter().all(|stopped| stopped)
+        results.into_iter().all(TerminationOutcome::succeeded)
     }
 
     async fn prune_evicted_sessions(&self) {
@@ -695,10 +765,28 @@ impl SessionStore {
 mod tests {
     use super::super::testsupport::*;
     use super::*;
-    use crate::session::SessionStatus;
+    use crate::session::{SessionMeta, SessionStatus};
     use chrono::Utc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn completed_meta(id: &str, status: SessionStatus) -> SessionMeta {
+        SessionMeta {
+            id: id.to_string(),
+            title: Some("Historical task".to_string()),
+            tags: vec!["release".to_string(), "backend".to_string()],
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            ended_at: Some(Utc::now()),
+            status,
+            pid: None,
+            exit_code: Some(0),
+            notifications_enabled: false,
+        }
+    }
     #[tokio::test]
     async fn test_run_maintenance_evicts_completed_session_after_ttl() {
         let rt = make_runtime("evict001", SessionStatus::Stopped, "", None);
@@ -824,6 +912,217 @@ mod tests {
         .await
         .expect_err("running source should require force");
         assert!(err.to_string().contains("pass --force"));
+    }
+
+    #[tokio::test]
+    async fn restart_db_only_completed_source_preserves_launch_metadata_and_history() {
+        for status in [
+            SessionStatus::Stopped,
+            SessionStatus::Killed,
+            SessionStatus::Failed,
+        ] {
+            let source_id = format!("hist-{}", status.as_str());
+            let source = completed_meta(&source_id, status);
+            let db = make_test_db().await;
+            db.insert_session(&source).await.expect("insert source");
+            let source_dir = db
+                .get_session_dir(&source_id)
+                .await
+                .expect("source dir lookup")
+                .expect("source dir");
+            std::fs::create_dir_all(&source_dir).expect("create source dir");
+            let source_log = source_dir.join("output.log");
+            std::fs::write(&source_log, b"historical output").expect("seed source log");
+
+            let store = Arc::new(SessionStore::new(900, db.clone()));
+            let mut config = make_test_config(2);
+            config.sessions_dir = source_dir.parent().expect("sessions root").to_path_buf();
+            let replacement_id =
+                SessionStore::restart_session_via_handle(&store, &config, &source_id, false)
+                    .await
+                    .expect("completed historical session should restart");
+
+            assert_ne!(replacement_id, source_id);
+            let replacement = db
+                .get_session(&replacement_id)
+                .await
+                .expect("replacement lookup")
+                .expect("replacement row");
+            assert_eq!(replacement.title, source.title);
+            assert_eq!(replacement.tags, source.tags);
+            assert_eq!(replacement.command, source.command);
+            assert_eq!(replacement.args, source.args);
+            assert_eq!(replacement.cwd, source.cwd);
+            assert_eq!(
+                replacement.notifications_enabled,
+                source.notifications_enabled
+            );
+            assert!(replacement.pid.is_some());
+            assert_eq!(replacement.status, SessionStatus::Running);
+
+            let retained = db
+                .get_session(&source_id)
+                .await
+                .expect("source lookup")
+                .expect("source row retained");
+            assert_eq!(retained.status, status);
+            assert_eq!(
+                std::fs::read(&source_log).expect("source log retained"),
+                b"historical output"
+            );
+
+            assert!(store.kill_session(&replacement_id).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_invalid_historical_cwd_without_creating_replacement() {
+        let db = make_test_db().await;
+        let mut source = completed_meta("badcwd", SessionStatus::Stopped);
+        source.cwd = Some(
+            std::env::temp_dir()
+                .join(format!("oly_missing_{}", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        db.insert_session(&source).await.expect("insert source");
+        let store = Arc::new(SessionStore::new(900, db.clone()));
+
+        let err = SessionStore::restart_session_via_handle(
+            &store,
+            &make_test_config(2),
+            &source.id,
+            false,
+        )
+        .await
+        .expect_err("missing cwd should reject restart");
+
+        assert!(err.to_string().contains("working directory does not exist"));
+        assert!(store.sessions.load().is_empty());
+        assert!(
+            db.get_session(&source.id)
+                .await
+                .expect("source lookup")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_force_confirms_source_killed_before_replacement() {
+        let (rt, _writer_rx) = make_runtime_writable("force001", SessionStatus::Running);
+        let source_meta = rt.read().meta.clone();
+        let db = make_test_db().await;
+        db.insert_session(&source_meta)
+            .await
+            .expect("insert source");
+        let store = Arc::new(store_with(vec![rt.clone()], db.clone()));
+        let mut config = make_test_config(1);
+        let sessions_root = db
+            .get_session_dir("force001")
+            .await
+            .expect("source dir lookup")
+            .expect("source dir")
+            .parent()
+            .expect("sessions root")
+            .to_path_buf();
+        config.sessions_dir = sessions_root;
+
+        let replacement_id =
+            SessionStore::restart_session_via_handle(&store, &config, "force001", true)
+                .await
+                .expect("forced restart should succeed after source exits");
+
+        let source = rt.read();
+        assert_eq!(source.meta.status, SessionStatus::Killed);
+        assert!(source.is_completed());
+        drop(source);
+        assert_ne!(replacement_id, "force001");
+        assert!(store.kill_session(&replacement_id).await);
+    }
+
+    #[tokio::test]
+    async fn failed_spawn_cleans_partial_replacement_but_preserves_source() {
+        let db = make_test_db().await;
+        let mut source = completed_meta("spawnfail", SessionStatus::Stopped);
+        source.command = format!("oly-command-that-does-not-exist-{}", uuid::Uuid::new_v4());
+        db.insert_session(&source).await.expect("insert source");
+        let source_dir = db
+            .get_session_dir(&source.id)
+            .await
+            .expect("source dir lookup")
+            .expect("source dir");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::write(source_dir.join("output.log"), b"source history").expect("seed source log");
+        let store = Arc::new(SessionStore::new(900, db.clone()));
+        let mut config = make_test_config(2);
+        config.sessions_dir = source_dir.parent().expect("sessions root").to_path_buf();
+
+        SessionStore::restart_session_via_handle(&store, &config, &source.id, false)
+            .await
+            .expect_err("missing command should fail replacement spawn");
+
+        let rows = db
+            .load_sessions_with_status(&[
+                SessionStatus::Created,
+                SessionStatus::Running,
+                SessionStatus::Stopping,
+                SessionStatus::Stopped,
+                SessionStatus::Killed,
+                SessionStatus::Failed,
+            ])
+            .await
+            .expect("load rows");
+        assert_eq!(rows.len(), 1, "partial replacement row should be deleted");
+        assert_eq!(rows[0].1.id, source.id);
+        assert_eq!(
+            std::fs::read(source_dir.join("output.log")).expect("source history retained"),
+            b"source history"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_failure_marks_retained_partial_row_failed() {
+        let store = SessionStore::new(900, make_test_db().await);
+        let config = make_test_config(1);
+        let prepared = store
+            .prepare_start_session(
+                &config,
+                StartSpec {
+                    title: None,
+                    tags: vec![],
+                    cmd: "missing".to_string(),
+                    args: vec![],
+                    cwd: None,
+                    rows: None,
+                    cols: None,
+                    notifications_enabled: true,
+                },
+            )
+            .await
+            .expect("prepare partial start");
+        let dir = store
+            .db
+            .get_session_dir(&prepared.meta.id)
+            .await
+            .expect("partial dir lookup")
+            .expect("partial dir");
+        std::fs::write(&dir, b"not a directory").expect("seed non-directory path");
+
+        let err = store
+            .abort_started_session(&prepared.meta.id)
+            .await
+            .expect_err("directory cleanup should fail");
+        assert!(matches!(err, AppError::Io(_)));
+        let retained = store
+            .db
+            .get_session(&prepared.meta.id)
+            .await
+            .expect("retained lookup")
+            .expect("retained row");
+        assert_eq!(retained.status, SessionStatus::Failed);
+        assert_eq!(retained.pid, None);
+        assert!(retained.ended_at.is_some());
+        let _ = std::fs::remove_file(dir);
     }
 
     #[tokio::test]

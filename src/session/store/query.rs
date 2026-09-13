@@ -109,6 +109,7 @@ impl SessionStore {
         };
 
         let summary = if let Some(handle) = live_handle {
+            let _persistence_guard = handle.persistence.lock().await;
             let meta = {
                 let mut rt = handle.write();
                 if notifications_enabled.is_some() && rt.is_completed() {
@@ -221,6 +222,7 @@ impl SessionStore {
         enabled: bool,
     ) -> std::result::Result<(), SessionError> {
         let handle = self.lookup_runtime(id).await?;
+        let _persistence_guard = handle.persistence.lock().await;
         let (meta, previous) = {
             let mut rt = handle.write();
             if rt.is_completed() {
@@ -231,7 +233,10 @@ impl SessionStore {
             (rt.meta.clone(), previous)
         };
         if let Err(err) = self.db.update_session(&meta).await {
-            handle.write().set_notifications_enabled(previous);
+            let mut rt = handle.write();
+            if rt.notifications_enabled == enabled {
+                rt.set_notifications_enabled(previous);
+            }
             debug!(session_id = id, %err, "failed to persist session notification setting");
             return Err(SessionError::Persistence(err.to_string()));
         }
