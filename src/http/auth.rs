@@ -473,7 +473,9 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
 fn build_auth_cookie(token: &str, secure: bool) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
     let max_age = AUTH_COOKIE_MAX_AGE.as_secs();
-    format!("{AUTH_COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure_flag}")
+    format!(
+        "{AUTH_COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure_flag}"
+    )
 }
 
 fn clear_auth_cookie() -> String {
