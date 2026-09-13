@@ -109,6 +109,7 @@ impl SessionStore {
         };
 
         let summary = if let Some(handle) = live_handle {
+            let _persistence_guard = handle.persistence.lock().await;
             let meta = {
                 let mut rt = handle.write();
                 if notifications_enabled.is_some() && rt.is_completed() {
@@ -221,11 +222,24 @@ impl SessionStore {
         enabled: bool,
     ) -> std::result::Result<(), SessionError> {
         let handle = self.lookup_runtime(id).await?;
-        let mut rt = handle.write();
-        if rt.is_completed() {
-            return Err(SessionError::NotRunning);
+        let _persistence_guard = handle.persistence.lock().await;
+        let (meta, previous) = {
+            let mut rt = handle.write();
+            if rt.is_completed() {
+                return Err(SessionError::NotRunning);
+            }
+            let previous = rt.notifications_enabled;
+            rt.set_notifications_enabled(enabled);
+            (rt.meta.clone(), previous)
+        };
+        if let Err(err) = self.db.update_session(&meta).await {
+            let mut rt = handle.write();
+            if rt.notifications_enabled == enabled {
+                rt.set_notifications_enabled(previous);
+            }
+            debug!(session_id = id, %err, "failed to persist session notification setting");
+            return Err(SessionError::Persistence(err.to_string()));
         }
-        rt.set_notifications_enabled(enabled);
         debug!(
             session_id = id,
             notifications_enabled = enabled,
@@ -393,6 +407,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta)
             .await
@@ -436,6 +451,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta)
             .await
@@ -479,6 +495,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta)
             .await
@@ -517,6 +534,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta)
             .await
