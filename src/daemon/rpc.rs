@@ -565,6 +565,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta).await.expect("insert session");
 

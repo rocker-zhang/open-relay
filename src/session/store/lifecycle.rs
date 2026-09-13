@@ -160,6 +160,7 @@ impl SessionStore {
             status: SessionStatus::Running,
             pid: None,
             exit_code: None,
+            notifications_enabled: spec.notifications_enabled,
         };
 
         state.starting_sessions.insert(id.clone());
