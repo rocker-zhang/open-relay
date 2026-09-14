@@ -231,6 +231,7 @@ pub(super) fn make_test_config(max_running_sessions: usize) -> AppConfig {
     AppConfig {
         http_bind: "127.0.0.1".to_string(),
         silence_seconds: 10,
+        notification_min_interval_seconds: 10,
         stop_grace_seconds: 5,
         session_eviction_seconds: 15,
         http_port: 0,
